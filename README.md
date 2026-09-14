@@ -280,3 +280,31 @@ fast-context-mcp/
 ## License
 
 MIT
+
+## Local reliability fork
+
+This fork limits each MCP server process to one active search, with at most eight
+accepted active/queued calls. Queueing, cooldown, retries and network work share a
+110-second deadline. MCP cancellation propagates to waits and network requests.
+Existing local read commands retain their own bounded timeouts; cancellation does
+not forcibly interrupt a synchronous file read already executing.
+
+Transient network errors, HTTP 429/500/502/503/504 and Connect
+resource_exhausted/unavailable/internal/aborted errors receive at most two retries
+at the inference request boundary, before local commands execute. Backoff is
+1s then 2s plus jitter, respecting Retry-After. Authentication errors and timeouts
+are not retried. Persistent exhaustion triggers a 30s process-wide cooldown (or
+longer Retry-After), not account switching. Queues are process-local: multiple MCP
+processes do not share a global account limit. Use one shared McpMux instance.
+
+Logs are JSON lines on stderr (stdout remains MCP-only). Set FC_LOG_FILE for
+persistent logging: rotation at 5 MiB retains one previous file. Fields include
+requestId, callId, queue/cooldown duration, attempt, status/RPC code, traceId,
+backoff and terminal outcome. Query text, file paths, tokens, response bodies and
+raw error messages are not logged. Logging failures never fail a search.
+
+No account pool is included. Random token switching does not solve service-wide
+outages and can conceal account restrictions. A future authorized pool should use
+one account per complete search, independently cached JWTs and per-account
+cooldowns, while retaining a global concurrency bound. Do not treat an ambiguous
+resource_exhausted response as proof that switching accounts will help.

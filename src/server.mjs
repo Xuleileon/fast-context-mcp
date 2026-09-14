@@ -19,6 +19,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
+import { runSearch } from "./reliability.mjs";
 import { searchWithContent, extractKeyInfo } from "./core.mjs";
 
 /**
@@ -143,7 +144,7 @@ server.tool(
         "Examples: ['node_modules', 'dist', '.git', 'build', 'coverage', '*.min.*']"
       ),
   },
-  async ({ query, project_path, tree_depth, max_turns, max_results, exclude_paths }) => {
+  async ({ query, project_path, tree_depth, max_turns, max_results, exclude_paths }, extra) => {
     let projectPath = project_path || process.cwd();
 
     try {
@@ -156,7 +157,7 @@ server.tool(
     }
 
     try {
-      const result = await searchWithContent({
+      const result = await runSearch(() => searchWithContent({
         query,
         projectRoot: projectPath,
         maxTurns: max_turns,
@@ -165,11 +166,12 @@ server.tool(
         treeDepth: tree_depth,
         timeoutMs: TIMEOUT_MS,
         excludePaths: exclude_paths,
-      });
-      return { content: [{ type: "text", text: result }] };
+      }), extra?.signal);
+      return { isError: /^\s*(?:Error\b|\[Error\])/.test(result), content: [{ type: "text", text: result }] };
     } catch (e) {
       const code = e.code || "UNKNOWN";
       return {
+        isError: true,
         content: [{
           type: "text", text:
             `Error [${code}]: ${e.message}\n\n` +

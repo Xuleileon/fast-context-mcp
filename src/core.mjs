@@ -11,6 +11,7 @@
  *   → ANSWER: file paths + line ranges + suggested rg patterns
  */
 
+import { retryRequest, requestSignal } from "./reliability.mjs";
 import { resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 import { randomUUID } from "node:crypto";
@@ -326,7 +327,7 @@ async function _unaryRequest(url, protoBytes, compress = true) {
     method: "POST",
     headers,
     body,
-    signal: AbortSignal.timeout(30000),
+    signal: requestSignal(30000),
   });
 
   let resp;
@@ -382,58 +383,35 @@ async function _streamingRequest(protoBytes, timeoutMs = 30000, maxRetries = 2) 
     "Sentry-Trace": `${traceId}-${spanId}-0`,
   };
 
-  const doFetch = () => fetch(url, {
-    method: "POST",
-    headers,
-    body: frame,
-    signal: AbortSignal.timeout(abortMs),
-  });
-
-  let lastErr;
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      let resp;
-      try {
-        resp = await doFetch();
-      } catch (e) {
-        if (attempt === 0) {
-          _applyTlsFallback();
-          resp = await doFetch();
-        } else {
-          throw e;
-        }
-      }
-
+  try {
+    return await retryRequest(async () => {
+      const resp = await fetch(url, {
+        method: "POST", headers, body: frame, signal: requestSignal(abortMs),
+      });
+      const retryAfter = resp.headers.get("retry-after");
+      const retryAfterMs = retryAfter === null ? 0 : (/^\d+(\.\d+)?$/.test(retryAfter)
+        ? Number(retryAfter) * 1000 : Math.max(0, Date.parse(retryAfter) - Date.now()) || 0);
       if (!resp.ok) {
-        const err = new Error(`HTTP ${resp.status}`);
-        err.status = resp.status;
-        // Don't retry on 4xx client errors (except 429)
-        if (resp.status >= 400 && resp.status < 500 && resp.status !== 429) {
-          throw err;
-        }
-        lastErr = err;
-        if (attempt < maxRetries) {
-          await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
-          continue;
-        }
-        throw err;
+        await resp.body?.cancel();
+        throw Object.assign(new Error(`HTTP ${resp.status}`), { status: resp.status, retryAfterMs });
       }
-
-      const arrayBuf = await resp.arrayBuffer();
-      return Buffer.from(arrayBuf);
-    } catch (e) {
-      lastErr = e;
-      // Don't retry on 4xx client errors (except 429)
-      if (e.status && e.status >= 400 && e.status < 500 && e.status !== 429) {
-        throw _classifyError(e);
+      const data = Buffer.from(await resp.arrayBuffer());
+      // Connect errors arrive with HTTP 200. Inspect before executing any tools.
+      for (const frameData of connectFrameDecode(data)) {
+        if (frameData[0] !== 123) continue;
+        let envelope;
+        try { envelope = JSON.parse(frameData.toString("utf8")); } catch { continue; }
+        if (!envelope.error) continue;
+        const knownCodes = ["resource_exhausted", "unavailable", "internal", "aborted", "permission_denied", "unauthenticated", "invalid_argument", "deadline_exceeded", "not_found", "failed_precondition", "unimplemented", "cancelled", "unknown"];
+        const rpcCode = knownCodes.includes(envelope.error.code) ? envelope.error.code : "unknown";
+        const traceId = /trace ID:\s*([a-f0-9]{32})/i.exec(envelope.error.message || "")?.[1];
+        throw Object.assign(new FastContextError(`Upstream Connect error: ${rpcCode}${traceId ? ` (trace ID: ${traceId})` : ""}`,
+          rpcCode === "resource_exhausted" ? "RATE_LIMITED" : ["permission_denied", "unauthenticated"].includes(rpcCode) ? "AUTH_ERROR" : "SERVER_ERROR"),
+          { rpcCode, status: resp.status, retryAfterMs, traceId });
       }
-      if (attempt < maxRetries) {
-        await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
-        continue;
-      }
-    }
-  }
-  throw _classifyError(lastErr);
+      return data;
+    }, { maxRetries });
+  } catch (e) { throw _classifyError(e); }
 }
 
 /**
@@ -783,7 +761,7 @@ export async function search({
       const baseMeta = { treeDepth: actualDepth, treeSizeKB: +(treeSizeBytes / 1024).toFixed(1), fellBack, projectRoot, errorCode: errCode };
 
       // Auto-retry with trimmed context on payload/timeout errors
-      if ((errCode === "PAYLOAD_TOO_LARGE" || errCode === "TIMEOUT") && messages.length > 4) {
+      if (errCode === "PAYLOAD_TOO_LARGE" && messages.length > 4) {
         log(`${errCode} on turn ${turn + 1}: trimming context and retrying...`);
         _trimMessages(messages);
         const retryProto = _buildRequest(apiKey, jwt, messages, toolDefs);
