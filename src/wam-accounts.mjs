@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createHash } from 'node:crypto';
-import { readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { diagnostic, requestSignal, lastUpstreamError } from './reliability.mjs';
 
@@ -9,7 +9,15 @@ const exec = promisify(execFile);
 const fingerprint = key => createHash('sha256').update(key).digest('hex');
 const fail = code => Object.assign(new Error(code), { code });
 
-export async function loadWamAccounts(executable = process.env.FC_WAM_EXE) {
+export function resolveWamExecutable(env = process.env, platform = process.platform, exists = existsSync) {
+  if (env.FC_WAM_EXE?.trim()) return env.FC_WAM_EXE;
+  // Preserve explicit single-key setups; otherwise prefer the installed account manager.
+  if (env.WINDSURF_API_KEY?.trim() || platform !== 'win32' || !env.LOCALAPPDATA) return undefined;
+  const installed = join(env.LOCALAPPDATA, 'Programs', 'WindsurfAccountManager', 'windsurf-account-manager.exe');
+  return exists(installed) ? installed : undefined;
+}
+
+export async function loadWamAccounts(executable = resolveWamExecutable()) {
   if (!executable) throw fail('WAM_NOT_CONFIGURED');
   try {
     const { stdout } = await exec(executable, ['--fast-context-credential'], {
@@ -26,7 +34,16 @@ export async function loadWamAccounts(executable = process.env.FC_WAM_EXE) {
       if (seen.has(id)) return false;
       seen.add(id); return true;
     });
-  } catch {
+  } catch (error) {
+    let reason;
+    try {
+      const code = JSON.parse(error.stdout).error;
+      if (['WAM_DATA_NOT_FOUND', 'WAM_STORAGE_ERROR'].includes(code)) reason = code;
+    } catch {}
+    diagnostic('wam_bridge_error', { code: typeof error.code === 'number' ? error.code :
+      ['ENOENT', 'EACCES', 'ABORT_ERR', 'WAM_INVALID_RESPONSE'].includes(error.code) ? error.code : 'BRIDGE_FAILED', reason,
+      appDataPresent: !!process.env.APPDATA,
+      databaseExists: !!process.env.APPDATA && existsSync(join(process.env.APPDATA, 'com.chao.windsurf-account-manager', 'accounts.db')) });
     // execFile errors can contain credential-bearing stdout. Never propagate them.
     throw fail('WAM_UNAVAILABLE: open WAM and log in, then refresh account information');
   }
@@ -119,8 +136,13 @@ export class AccountPool {
 
 let pool;
 export async function withWamAccount(task) {
-  if (!process.env.FC_WAM_EXE) return task(undefined);
+  const executable = resolveWamExecutable();
+  if (!executable) {
+    diagnostic('account_mode', { mode: 'single' });
+    return task(undefined);
+  }
   pool ||= new AccountPool({ file: process.env.FC_WAM_STATE_FILE || join(process.env.LOCALAPPDATA || process.cwd(), 'fast-context-mcp', 'account-state.json') });
-  const accounts = await loadWamAccounts();
+  const accounts = await loadWamAccounts(executable);
+  diagnostic('account_mode', { mode: 'pool', eligibleAccounts: accounts.length });
   return pool.run(accounts, key => { lastUpstreamError(true); return task(key); }, { getFailure: lastUpstreamError, signal: requestSignal(110000) });
 }

@@ -3,12 +3,21 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { AccountPool, classifyFailure, loadWamAccounts } from '../src/wam-accounts.mjs';
+import { AccountPool, classifyFailure, loadWamAccounts, resolveWamExecutable, withWamAccount } from '../src/wam-accounts.mjs';
 import { runSearch, lastUpstreamError } from '../src/reliability.mjs';
 import { searchWithContent } from '../src/core.mjs';
 import { connectFrameEncode, ProtobufEncoder } from '../src/protobuf.mjs';
 const accounts = [{ accountId: 'a', apiKey: 'fake-a' }, { accountId: 'b', apiKey: 'fake-b' }];
 const quiet = () => {};
+test('missing launcher environment discovers installed WAM without overriding explicit credentials', () => {
+  const env = { LOCALAPPDATA: 'C:/fixture' };
+  const installed = join(env.LOCALAPPDATA, 'Programs', 'WindsurfAccountManager', 'windsurf-account-manager.exe');
+  assert.equal(resolveWamExecutable(env, 'win32', p => p === installed), installed);
+  assert.equal(resolveWamExecutable(env, 'win32', () => false), undefined);
+  assert.equal(resolveWamExecutable(env, 'linux', () => true), undefined);
+  assert.equal(resolveWamExecutable({ ...env, WINDSURF_API_KEY: 'explicit' }, 'win32', () => true), undefined);
+  assert.equal(resolveWamExecutable({ ...env, FC_WAM_EXE: 'custom.exe', WINDSURF_API_KEY: 'explicit' }, 'win32', () => false), 'custom.exe');
+});
 test('oldest healthy account selected and cooldown skipped', () => {
   let now = 1000;
   const pool = new AccountPool({ now: () => now, log: quiet });
@@ -68,6 +77,19 @@ test('successful result ignores recovered upstream error', async () => {
 test('bridge error does not expose subprocess output', async () => {
   await assert.rejects(loadWamAccounts('nonexistent-wam-test.exe'), /WAM_UNAVAILABLE/);
   assert.equal(classifyFailure(undefined, 'Error: Rate limited, please try again later'), 'limited');
+});
+
+test('configured WAM failure never silently falls back to a single credential', async () => {
+  const previous = process.env.FC_WAM_EXE;
+  process.env.FC_WAM_EXE = 'nonexistent-wam-test.exe';
+  let called = false;
+  try {
+    await assert.rejects(withWamAccount(() => { called = true; }), /WAM_UNAVAILABLE/);
+    assert.equal(called, false);
+  } finally {
+    if (previous === undefined) delete process.env.FC_WAM_EXE;
+    else process.env.FC_WAM_EXE = previous;
+  }
 });
 
 test('wrapped HTTP auth and quota errors retain classification', () => {

@@ -316,7 +316,11 @@ will succeed. The global concurrency bound and process-wide cooldown remain in p
 
 ### WAM local account source (fork)
 
-Set `FC_WAM_EXE` to the installed WAM fork executable. WAM must contain logged-in,
+Set `FC_WAM_EXE` to the installed WAM fork executable. On Windows, when neither this
+setting nor an explicit `WINDSURF_API_KEY` is present, the server also discovers
+`%LOCALAPPDATA%/Programs/WindsurfAccountManager/windsurf-account-manager.exe`.
+An explicit `FC_WAM_EXE` takes priority over both automatic discovery and a single key.
+WAM must contain logged-in,
 active accounts with a Windsurf API key. The MCP reads only account IDs and API keys
 through a short-lived local process pipe; passwords and refresh tokens are not exported.
 No plaintext token file or HTTP credential endpoint is used. When enabled, WAM failure
@@ -338,3 +342,10 @@ Run a single shared MCP instance through McpMux; independent processes must use 
 state files and do not share the in-process request queue. Existing structured diagnostics
 include account IDs and failover categories, never keys. This integration does not keep
 sessions alive with background traffic: refresh or log in in WAM when necessary.
+
+Each request logs `account_mode` (`pool` with the eligible account count, or `single`).
+Bridge failures log only an allowlisted error category and database-presence booleans,
+never subprocess stdout. Check these events rather than assuming an installed plugin
+means account rotation is enabled. For McpMux user-config servers, preserve `FC_WAM_EXE`
+in the source space JSON, not only the cached database definition. Restart the gateway
+after changing its launcher environment; reconnecting a child can retain stale settings.
