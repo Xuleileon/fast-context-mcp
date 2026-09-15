@@ -35,6 +35,7 @@ import {
   _parseAnswer,
   FINAL_FORCE_ANSWER,
   buildWindsurfPrompt,
+  sourceSnippets,
 } from "./shared.mjs";
 import { buildCacheKey, getCachedResult, setCachedResult, computeMtimeHash } from "./cache.mjs";
 
@@ -703,11 +704,11 @@ export async function search({
   const log = (msg) => onProgress?.(msg);
   projectRoot = resolve(projectRoot);
 
-  // Cache hits must avoid auth/network and repo-map work. The recursive mtime
-  // fingerprint includes file paths, sizes, and mtimes, so it also invalidates
-  // when the searchable tree changes.
+  // Cache hits avoid auth/network and repo-map work. The bounded recursive
+  // fingerprint tracks visited file paths, sizes and mtimes; the cache also
+  // validates every returned file's stats independently of that walk.
   const mtimeHash = computeMtimeHash(projectRoot, excludePaths);
-  const cacheKey = buildCacheKey({ query, model: WS_MODEL, maxTurns, maxResults, treeDepth, mtimeHash, excludePaths });
+  const cacheKey = buildCacheKey({ query, projectRoot, model: WS_MODEL, maxTurns, maxCommands, maxResults, treeDepth, mtimeHash, excludePaths });
   const cached = getCachedResult(cacheKey);
   if (cached) {
     log("Cache hit");
@@ -903,6 +904,7 @@ export async function search({
  * @param {number} [opts.treeDepth=3]
  * @param {number} [opts.timeoutMs=30000]
  * @param {string[]} [opts.excludePaths=[]]
+ * @param {number} [opts.snippetChars=6000] - Total appended excerpt characters (0-12000)
  * @returns {Promise<string>}
  */
 export async function searchWithContent({
@@ -915,7 +917,11 @@ export async function searchWithContent({
   treeDepth = 3,
   timeoutMs = 30000,
   excludePaths = [],
+  snippetChars = 6000,
 }) {
+  if (!Number.isSafeInteger(snippetChars) || snippetChars < 0 || snippetChars > 12000) {
+    throw new RangeError("snippetChars must be an integer from 0 to 12000");
+  }
   const result = await search({ query, projectRoot, apiKey, maxTurns, maxCommands, maxResults, treeDepth, timeoutMs, excludePaths });
 
   if (result.error) {
@@ -947,9 +953,12 @@ export async function searchWithContent({
   // Deduplicate + filter short patterns
   const uniquePatterns = [...new Set(rgPatterns)].filter((p) => p.length >= 3);
 
+  const excerpts = sourceSnippets(files, projectRoot, snippetChars, excludePaths);
+  const context = `\n[context] version=1, budget_chars=${snippetChars}, used_chars=${excerpts.length}${excerpts}`;
+
   if (!files.length && !uniquePatterns.length) {
     const raw = result.raw_response || "";
-    return raw ? `No relevant files found.\n\nRaw response:\n${raw}` : "No relevant files found.";
+    return (raw ? `No relevant files found.\n\nRaw response:\n${raw}` : "No relevant files found.") + context;
   }
 
   const parts = [];
@@ -983,7 +992,7 @@ export async function searchWithContent({
     parts.push(configLine);
   }
 
-  return parts.join("\n");
+  return parts.join("\n") + context;
 }
 
 /**

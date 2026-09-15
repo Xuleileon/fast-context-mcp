@@ -88,8 +88,6 @@ export class AccountPool {
     else if (kind === 'limited') {
       const until = this.now() + Math.max(60000, Number.isFinite(retryAfterMs) ? retryAfterMs : 0);
       state.cooldownUntil = until;
-      // Unknown account/global quota scope: cool the entire pool, never hop keys.
-      this.state.cooldownUntil = Math.max(this.state.cooldownUntil, until);
     } else state.cooldownUntil = this.now() + 30000;
     this.save();
     this.log('account_result', { accountId: account.accountId, outcome: kind });
@@ -104,14 +102,14 @@ export class AccountPool {
       const upstream = error || (/^\s*(?:Error\b|\[Error\])/.test(result || '') ? getFailure() : undefined);
       const kind = classifyFailure(upstream, result);
       this.report(account, kind, upstream?.retryAfterMs);
-      // Read-only search only. No replay for quota, permission or authentication errors.
-      if (kind === 'network' && attempt === 0 && !signal?.aborted) {
+      // Read-only search only. No replay for permission or authentication errors.
+      if (['network', 'limited'].includes(kind) && attempt === 0 && !signal?.aborted) {
         excluded.add(account.fingerprint);
         const ready = accounts.some(a => {
           const id = fingerprint(a.apiKey), s = this.state.accounts[id];
           return !excluded.has(id) && !s?.blocked && !(s?.cooldownUntil > this.now());
         });
-        if (ready) { this.log('account_failover', { reason: 'network' }); continue; }
+        if (ready) { this.log('account_failover', { reason: kind }); continue; }
       }
       if (error) throw error;
       return result;

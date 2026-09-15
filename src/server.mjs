@@ -67,7 +67,7 @@ const server = new McpServer({
   version: "1.3.2",
   instructions:
     "Windsurf Fast Context — AI-driven semantic code search. " +
-    "Returns file paths with line ranges and grep keywords.\n" +
+    "Returns file paths with line ranges, grep keywords, and bounded local source excerpts.\n" +
     "Tunable parameters:\n" +
     "- tree_depth (1-6, default 3): How much directory structure the remote AI sees. " +
     "REDUCE if you get payload/size errors. INCREASE for small projects where deeper structure helps.\n" +
@@ -85,7 +85,7 @@ server.tool(
   "fast_context_search",
   "AI-driven semantic code search using Windsurf's Devstral model. " +
   "Searches a codebase with natural language and returns relevant file paths with line ranges, " +
-  "plus suggested grep keywords for follow-up searches.\n" +
+  "plus suggested grep keywords and bounded local source excerpts for follow-up searches.\n" +
   "Parameter tuning guide:\n" +
   "- tree_depth: Controls how much directory structure the remote AI sees before searching. " +
   "If you get a payload/size error, REDUCE this value. " +
@@ -136,6 +136,13 @@ server.tool(
         "Use a smaller value (3-5) for focused queries. " +
         "Use a larger value (15-30) for broad exploration queries."
       ),
+    snippet_chars: z
+      .number()
+      .int()
+      .min(0)
+      .max(12000)
+      .default(6000)
+      .describe("Total source excerpt characters, including headers and newlines. Default 6000; 0 disables excerpts. Successful responses include a [context] budget/usage line."),
     exclude_paths: z
       .array(z.string())
       .default([])
@@ -145,7 +152,7 @@ server.tool(
         "Examples: ['node_modules', 'dist', '.git', 'build', 'coverage', '*.min.*']"
       ),
   },
-  async ({ query, project_path, tree_depth, max_turns, max_results, exclude_paths }, extra) => {
+  async ({ query, project_path, tree_depth, max_turns, max_results, exclude_paths, snippet_chars }, extra) => {
     let projectPath = project_path || process.cwd();
 
     try {
@@ -168,6 +175,7 @@ server.tool(
         treeDepth: tree_depth,
         timeoutMs: TIMEOUT_MS,
         excludePaths: exclude_paths,
+        snippetChars: snippet_chars,
       })), extra?.signal);
       return { isError: /^\s*(?:Error\b|\[Error\])/.test(result), content: [{ type: "text", text: result }] };
     } catch (e) {

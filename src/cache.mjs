@@ -8,8 +8,8 @@
  */
 
 import { createHash } from "node:crypto";
-import { readdirSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { readdirSync, statSync, realpathSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { _excludePatternToRegex } from "./shared.mjs";
 
 // ─── Config ────────────────────────────────────────────────
@@ -40,8 +40,15 @@ function _getMaxEntries() {
 
 // ─── Cache Store ───────────────────────────────────────────
 
-/** @type {Map<string, { result: Object, expiresAt: number }>} */
+/** @type {Map<string, { result: Object, expiresAt: number, fileStats: Array }>} */
 const _store = new Map();
+
+function fileStamp(path) {
+  try {
+    const stat = statSync(path);
+    return stat.isFile() ? `${realpathSync(path)}:${stat.mtimeMs}:${stat.size}` : null;
+  } catch { return null; }
+}
 
 /**
  * Compute an aggregate hash of file mtimes + sizes under projectRoot.
@@ -89,12 +96,16 @@ export function computeMtimeHash(projectRoot, excludePaths = []) {
 
 /**
  * Build a deterministic cache key from search parameters.
- * @param {{ query: string, model: string, maxTurns: number, maxResults: number, treeDepth: number, repoMapHash?: string, mtimeHash?: string, excludePaths?: string[] }} params
+ * @param {{ query: string, projectRoot?: string, model: string, maxTurns: number, maxCommands?: number, maxResults: number, treeDepth: number, repoMapHash?: string, mtimeHash?: string, excludePaths?: string[] }} params
  * @returns {string}
  */
-export function buildCacheKey({ query, model, maxTurns, maxResults, treeDepth, repoMapHash = "", mtimeHash = "", excludePaths = [] }) {
-  const excl = [...excludePaths].sort().join(",");
-  const input = `${query}|${model}|${maxTurns}|${maxResults}|${treeDepth}|${repoMapHash}|${mtimeHash}|${excl}`;
+export function buildCacheKey({ query, projectRoot = "", model, maxTurns, maxCommands = 8, maxResults, treeDepth, repoMapHash = "", mtimeHash = "", excludePaths = [] }) {
+  let root = projectRoot ? resolve(projectRoot) : "";
+  if (root) {
+    try { root = realpathSync(root); } catch { /* Keep the absolute missing root. */ }
+    if (process.platform === "win32") root = root.toLowerCase();
+  }
+  const input = JSON.stringify([query, root, model, maxTurns, maxCommands, maxResults, treeDepth, repoMapHash, mtimeHash, [...excludePaths].sort()]);
   return createHash("sha256").update(input).digest("hex");
 }
 
@@ -111,7 +122,12 @@ export function getCachedResult(key) {
     _store.delete(key);
     return null;
   }
-  return entry.result;
+  // Check every returned file, including those beyond the bounded tree fingerprint.
+  if (entry.fileStats.some(([path, stamp]) => stamp === null || fileStamp(path) !== stamp)) {
+    _store.delete(key);
+    return null;
+  }
+  return structuredClone(entry.result);
 }
 
 /**
@@ -131,7 +147,10 @@ export function setCachedResult(key, result) {
     _store.delete(oldestKey);
   }
 
-  _store.set(key, { result, expiresAt: Date.now() + ttl });
+  const copy = structuredClone(result);
+  const paths = [...new Set((copy.files || []).map((file) => file.full_path).filter((path) => typeof path === "string"))];
+  const fileStats = paths.map((path) => [path, fileStamp(path)]);
+  _store.set(key, { result: copy, expiresAt: Date.now() + ttl, fileStats });
 }
 
 /**

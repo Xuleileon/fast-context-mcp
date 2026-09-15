@@ -5,7 +5,8 @@
  * constants, and the Windsurf prompt builder.
  */
 
-import { readdirSync } from "node:fs";
+import { readdirSync, realpathSync, lstatSync, openSync, fstatSync, readSync, closeSync, constants } from "node:fs";
+import { resolve, relative, join, sep, isAbsolute } from "node:path";
 import treeNodeCli from "tree-node-cli";
 import { resolveWithinRoot } from "./path-safety.mjs";
 
@@ -121,6 +122,136 @@ export function _parseAnswer(xmlText, projectRoot) {
     files.push({ path: rel, full_path: fullPath, ranges });
   }
   return { files };
+}
+
+/**
+ * Read bounded, fresh source excerpts from structured locator results.
+ * Filtering affects excerpts only; caller-owned files and ranges are never changed.
+ * @param {Array} files
+ * @param {string} projectRoot
+ * @param {number} [budget=6000] - Total rendered characters, including headers/newlines
+ * @param {string[]} [excludePaths=[]] - Basename or root-relative simple glob patterns
+ * @returns {string}
+ */
+export function sourceSnippets(files, projectRoot, budget = 6000, excludePaths = []) {
+  if (!Number.isSafeInteger(budget) || budget < 0 || budget > 12000) {
+    throw new RangeError("snippetChars must be an integer from 0 to 12000");
+  }
+  if (!budget || !Array.isArray(files) || !files.length) return "";
+  let root;
+  try { root = realpathSync(projectRoot); } catch { return ""; }
+  const lexicalRoot = resolve(projectRoot);
+  const excludes = excludePaths.map((pattern) => {
+    const normalized = pattern.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
+    const patterns = [normalized];
+    // A leading **/ also matches at the root, as in common exclude globs.
+    if (normalized.startsWith("**/")) patterns.push(normalized.slice(3));
+    return { rooted: normalized.includes("/"), regexes: patterns.map(_excludePatternToRegex) };
+  });
+  const candidatesByPath = new Map();
+  let reads = 0;
+  for (const file of files) {
+    const ranges = Array.isArray(file?.ranges) ? file.ranges.filter((range) =>
+      Array.isArray(range) && range.length === 2 && Number.isSafeInteger(range[0]) &&
+      Number.isSafeInteger(range[1]) && range[0] >= 1 && range[1] >= range[0]
+    ).map(([start, end]) => ({ start, end })) : [];
+    if (!ranges.length) continue;
+    try {
+      const lexicalTarget = resolveWithinRoot(projectRoot, file.full_path);
+      const rel = relative(lexicalRoot, lexicalTarget);
+      if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) continue;
+      const parts = rel.split(sep);
+      const relativePath = parts.join("/");
+      if (/[\x00-\x1f\x7f:]/.test(relativePath) || parts.some((part) => part.startsWith(".") || /^(?:node_modules|vendor|credentials?|secrets?|private|config|logs?)$/i.test(part)) ||
+          /(?:secret|credential|token|password|\.pem$|\.key$)/i.test(relativePath)) continue;
+      if (!/\.(?:[cm]?[jt]sx?|py|go|rs|java|cs|cpp|c|h|hpp|rb|php|swift|kt|scala|vue|svelte|css|scss|html)$/i.test(relativePath)) continue;
+      const prefixes = parts.map((_, i) => parts.slice(0, i + 1).join("/"));
+      if (excludes.some(({ rooted, regexes }) =>
+        (rooted ? prefixes : parts).some((part) => regexes.some((rx) => rx.test(part)))
+      )) continue;
+      const target = resolveWithinRoot(root, relativePath);
+      let cursor = root;
+      let unsafe = false;
+      for (const part of parts) {
+        cursor = join(cursor, part);
+        if (lstatSync(cursor).isSymbolicLink()) { unsafe = true; break; }
+      }
+      if (unsafe || !lstatSync(target).isFile()) continue;
+      const canonical = realpathSync(target);
+      const key = process.platform === "win32" ? canonical.toLowerCase() : canonical;
+      if (key !== (process.platform === "win32" ? target.toLowerCase() : target)) continue;
+      if (candidatesByPath.has(key)) {
+        candidatesByPath.get(key).ranges.push(...ranges);
+        continue;
+      }
+      if (reads >= 30) continue;
+      // Count attempts too, so unreadable/unsafe content cannot bypass the read cap.
+      reads++;
+      const candidate = { relative: relativePath, ranges, lines: [] };
+      candidatesByPath.set(key, candidate);
+      const fd = openSync(target, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
+      let data;
+      try {
+        const before = fstatSync(fd);
+        if (!before.isFile() || before.size > 256 * 1024) continue;
+        const buffer = Buffer.alloc(before.size);
+        let size = 0;
+        while (size < buffer.length) {
+          const count = readSync(fd, buffer, size, buffer.length - size, size);
+          if (!count) break;
+          size += count;
+        }
+        const after = fstatSync(fd);
+        if (size !== before.size || after.size !== before.size || after.mtimeMs !== before.mtimeMs) continue;
+        data = buffer.subarray(0, size);
+      } finally { closeSync(fd); }
+      if (data.some((byte) => byte < 9 || (byte > 10 && byte < 13) || (byte > 13 && byte < 32) || byte === 127)) continue;
+      const source = new TextDecoder("utf-8", { fatal: true }).decode(data);
+      // Skip entire files with likely credentials, not just the requested lines.
+      if (/(?:api[_ -]?key|secret|password|passwd|token|access[_ -]?token|refresh[_ -]?token|authorization|cookie|密码|密钥|令牌)\s*["']?\s*[:=：]\s*["'`][^"'`]+["'`]|\bBearer\s+[A-Za-z0-9._~+/-]{8,}|-----BEGIN [^-]*PRIVATE KEY-----|\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{12,}|github_pat_[A-Za-z0-9_]+|npm_[A-Za-z0-9]{20,}|AKIA[A-Z0-9]{16})\b|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|:\/\/[^\s/]+:[^\s/]+@/i.test(source)) continue;
+      candidate.lines = source ? source.split(/\r\n|\n|\r/) : [];
+      if (/[\r\n]$/.test(source)) candidate.lines.pop();
+    } catch { /* Missing, unreadable, unsafe or non-text files are not excerpts. */ }
+  }
+  const candidates = [];
+  for (const { relative, ranges, lines } of candidatesByPath.values()) {
+    const merged = [];
+    for (const { start, end } of ranges.sort((a, b) => a.start - b.start || a.end - b.end)) {
+      if (start > lines.length) continue;
+      const clippedEnd = Math.min(end, lines.length);
+      const previous = merged.at(-1);
+      if (previous && start <= previous.end + 1) previous.end = Math.max(previous.end, clippedEnd);
+      else merged.push({ start, end: clippedEnd });
+    }
+    const windows = merged.slice(0, 3).map(({ start, end }) => ({ start, count: 0,
+      lines: lines.slice(start - 1, Math.min(end, start + 19)).map((line, i) => `${start + i}: ${line}`),
+    }));
+    if (windows.length) candidates.push({ relative, windows });
+  }
+  const render = (file, window, count) => count
+    ? `\n\nSource excerpt: ${file.relative} (L${window.start}-${window.start + count - 1})\n${window.lines.slice(0, count).join("\n")}` : "";
+  // Grow selections in place: refill must not erase previously selected windows.
+  const fill = (file, allowance, firstOnly = false) => {
+    let spent = 0;
+    for (const window of file.windows) {
+      while (window.count < window.lines.length) {
+        const cost = render(file, window, window.count + 1).length - render(file, window, window.count).length;
+        if (cost > allowance - spent) break;
+        window.count++;
+        spent += cost;
+        if (firstOnly) return spent;
+      }
+    }
+    return spent;
+  };
+  let remaining = budget;
+  const share = candidates.length ? Math.floor(budget / candidates.length) : 0;
+  for (const file of candidates) remaining -= fill(file, share);
+  for (const file of candidates) {
+    if (!file.windows.some((window) => window.count)) remaining -= fill(file, remaining, true);
+  }
+  for (const file of candidates) remaining -= fill(file, remaining);
+  return candidates.flatMap((file) => file.windows.map((window) => render(file, window, window.count))).join("");
 }
 
 // ─── Prompt Builders ───────────────────────────────────────

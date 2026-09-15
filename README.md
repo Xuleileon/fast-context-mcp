@@ -21,7 +21,7 @@ You: "where is the authentication logic?"
 │  5. Returns results to AI
 │  6. Repeats for N rounds
 │  7. Returns file paths + line ranges
-│     + suggested search keywords
+│     + keywords + bounded source
 └─────────────────────────┘
          │
          ▼
@@ -182,13 +182,17 @@ AI-driven semantic code search with tunable parameters.
 | `max_turns` | integer | No | `3` | Search rounds (1-5). More = deeper search but slower. Use 1-2 for simple lookups, 3 for most queries, 4-5 for complex analysis. |
 | `max_results` | integer | No | `10` | Maximum number of files to return (1-30). Smaller = more focused, larger = broader exploration. |
 | `exclude_paths` | string[] | No | `[]` | Directory/file patterns excluded from the repository map and search context. |
+| `snippet_chars` | integer | No | `6000` | Total appended source budget across files (0–12000), including excerpt headers and line numbers. Set 0 to omit excerpts without changing tools. |
 
 Returns:
 1. **Relevant files** with line ranges
 2. **Suggested search keywords** (rg patterns used during AI search)
 3. **Diagnostic metadata** (`[config]` line showing actual tree_depth used, tree size, and whether fallback occurred)
+4. **Bounded source excerpts**, allocated across distinct files before refilling unused capacity. Source is reread locally even on a locator cache hit. Each file contributes at most three ranges of twenty complete lines; missing, excluded, unsafe or oversized files can remain locator-only.
 
-Example output:
+Successful responses include `[context] version=1, budget_chars=N, used_chars=M` before the excerpts. `M` counts the appended excerpt text in JavaScript UTF-16 code units (headers/newlines included), not tokens or bytes. A zero value also means enrichment has already been handled; adapters should not add a second set of excerpts. The original locator list and diagnostics remain available regardless of this budget. Read omitted ranges, wider context or code needing verification before edits. Filtering is conservative, not a complete secret scanner.
+
+Example output (locator section, followed by the context marker and any excerpts):
 ```
 Found 3 relevant files.
 
@@ -252,6 +256,7 @@ fast-context-mcp/
 5. Commands executed locally in parallel (up to `FC_MAX_COMMANDS` per round)
 6. Results sent back to Devstral for the next round
 7. After `max_turns` rounds, Devstral returns file paths + line ranges
+8. The local server validates and supplements those ranges with budgeted source excerpts before returning the same tool response
 8. All rg patterns used during search are collected as suggested keywords
 9. Diagnostic metadata appended to help the calling AI tune parameters
 
@@ -294,7 +299,8 @@ resource_exhausted/unavailable/internal/aborted errors receive at most two retri
 at the inference request boundary, before local commands execute. Backoff is
 1s then 2s plus jitter, respecting Retry-After. Authentication errors and timeouts
 are not retried. Persistent exhaustion triggers a 30s process-wide cooldown (or
-longer Retry-After), not account switching. Queues are process-local: multiple MCP
+longer Retry-After) for subsequent queued searches. With WAM enabled, the current
+search may also fail over once as described below. Queues are process-local: multiple MCP
 processes do not share a global account limit. Use one shared McpMux instance.
 
 Logs are JSON lines on stderr (stdout remains MCP-only). Set FC_LOG_FILE for
@@ -303,11 +309,9 @@ requestId, callId, queue/cooldown duration, attempt, status/RPC code, traceId,
 backoff and terminal outcome. Query text, file paths, tokens, response bodies and
 raw error messages are not logged. Logging failures never fail a search.
 
-No account pool is included. Random token switching does not solve service-wide
-outages and can conceal account restrictions. A future authorized pool should use
-one account per complete search, independently cached JWTs and per-account
-cooldowns, while retaining a global concurrency bound. Do not treat an ambiguous
-resource_exhausted response as proof that switching accounts will help.
+Account failover requires the WAM pool below. Switching accounts does not solve
+service-wide outages; resource_exhausted does not guarantee that another account
+will succeed. The global concurrency bound and process-wide cooldown remain in place.
 
 
 ### WAM local account source (fork)
@@ -319,12 +323,14 @@ No plaintext token file or HTTP credential endpoint is used. When enabled, WAM f
 never silently falls back to WINDSURF_API_KEY or another desktop account.
 
 Within the single MCP server queue, choose the least recently used eligible account
-and pin it for the whole read-only search. Network disconnects and 502/503/504 may
-replay the search on one other healthy account, at most once and within the existing
-deadline. Authentication errors cool that credential for five minutes; permission denial
+and pin it for the whole read-only search. Network disconnects, 502/503/504,
+resource_exhausted and HTTP 429 may replay the search on one other healthy account,
+at most once in total and within the existing deadline, after request-level retries.
+Authentication errors cool that credential for five minutes; permission denial
 blocks that credential. Changed API keys have independent state. Resource exhaustion
-and 429 cool the entire pool for at least 60 seconds or Retry-After, whichever is longer;
-they never trigger account failover. This is not a quota-extension mechanism.
+and 429 cool only the affected account for at least 60 seconds or Retry-After, whichever
+is longer. If no other account is ready, the original failure is returned; authentication
+and permission errors never trigger account failover.
 
 Nonsecret account fingerprints, last-used times and cooldowns persist at
 `%LOCALAPPDATA%/fast-context-mcp/account-state.json` (override with FC_WAM_STATE_FILE).
