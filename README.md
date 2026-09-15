@@ -308,3 +308,27 @@ outages and can conceal account restrictions. A future authorized pool should us
 one account per complete search, independently cached JWTs and per-account
 cooldowns, while retaining a global concurrency bound. Do not treat an ambiguous
 resource_exhausted response as proof that switching accounts will help.
+
+
+### WAM local account source (fork)
+
+Set `FC_WAM_EXE` to the installed WAM fork executable. WAM must contain logged-in,
+active accounts with a Windsurf API key. The MCP reads only account IDs and API keys
+through a short-lived local process pipe; passwords and refresh tokens are not exported.
+No plaintext token file or HTTP credential endpoint is used. When enabled, WAM failure
+never silently falls back to WINDSURF_API_KEY or another desktop account.
+
+Within the single MCP server queue, choose the least recently used eligible account
+and pin it for the whole read-only search. Network disconnects and 502/503/504 may
+replay the search on one other healthy account, at most once and within the existing
+deadline. Authentication errors cool that credential for five minutes; permission denial
+blocks that credential. Changed API keys have independent state. Resource exhaustion
+and 429 cool the entire pool for at least 60 seconds or Retry-After, whichever is longer;
+they never trigger account failover. This is not a quota-extension mechanism.
+
+Nonsecret account fingerprints, last-used times and cooldowns persist at
+`%LOCALAPPDATA%/fast-context-mcp/account-state.json` (override with FC_WAM_STATE_FILE).
+Run a single shared MCP instance through McpMux; independent processes must use separate
+state files and do not share the in-process request queue. Existing structured diagnostics
+include account IDs and failover categories, never keys. This integration does not keep
+sessions alive with background traffic: refresh or log in in WAM when necessary.

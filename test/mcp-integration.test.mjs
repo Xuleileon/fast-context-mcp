@@ -8,9 +8,10 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 
-const SERVER_PATH = new URL("../src/server.mjs", import.meta.url).pathname;
+const SERVER_PATH = fileURLToPath(new URL("../src/server.mjs", import.meta.url));
 
 class McpClient {
   constructor() {

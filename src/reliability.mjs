@@ -23,6 +23,13 @@ export function diagnostic(event, fields = {}) {
   } catch { process.stderr.write('{"event":"log_write_failed"}\n'); }
 }
 
+export function lastUpstreamError(clear = false) {
+  const state = context.getStore();
+  const error = state?.lastError;
+  if (clear && state) state.lastError = undefined;
+  return error;
+}
+
 export function requestSignal(timeoutMs) {
   const signal = context.getStore()?.signal;
   return signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs);
@@ -79,6 +86,7 @@ export async function retryRequest(operation, { maxRetries = 2, sleep = delay, r
       diagnostic('upstream', { callId, attempt: attempt + 1, outcome: 'success', elapsedMs: Date.now() - start });
       return result;
     } catch (e) {
+      if (state) state.lastError = e;
       const transient = ['resource_exhausted', 'unavailable', 'internal', 'aborted'].includes(e.rpcCode)
         || e.status === 429 || [500, 502, 503, 504].includes(e.status)
         || (e instanceof TypeError && !e.status && !e.rpcCode);

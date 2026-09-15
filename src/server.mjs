@@ -19,6 +19,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
+import { withWamAccount } from "./wam-accounts.mjs";
 import { runSearch } from "./reliability.mjs";
 import { searchWithContent, extractKeyInfo } from "./core.mjs";
 
@@ -157,7 +158,8 @@ server.tool(
     }
 
     try {
-      const result = await runSearch(() => searchWithContent({
+      const result = await runSearch(() => withWamAccount(apiKey => searchWithContent({
+        apiKey,
         query,
         projectRoot: projectPath,
         maxTurns: max_turns,
@@ -166,7 +168,7 @@ server.tool(
         treeDepth: tree_depth,
         timeoutMs: TIMEOUT_MS,
         excludePaths: exclude_paths,
-      }), extra?.signal);
+      })), extra?.signal);
       return { isError: /^\s*(?:Error\b|\[Error\])/.test(result), content: [{ type: "text", text: result }] };
     } catch (e) {
       const code = e.code || "UNKNOWN";
