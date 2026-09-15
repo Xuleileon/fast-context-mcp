@@ -34,8 +34,8 @@ export async function loadWamAccounts(executable = process.env.FC_WAM_EXE) {
 
 export function classifyFailure(error, result) {
   if (!error && !/^\s*(?:Error\b|\[Error\])/.test(result || '')) return null;
-  const code = error?.rpcCode;
-  const status = error?.status;
+  const code = error?.rpcCode || error?.details?.rpcCode;
+  const status = error?.status || error?.details?.status;
   const text = typeof result === 'string' ? result : '';
   if (code === 'resource_exhausted' || status === 429 || /error_type=RATE_LIMITED|resource_exhausted|Rate limited/i.test(text)) return 'limited';
   if (code === 'permission_denied' || status === 403) return 'denied';

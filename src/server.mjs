@@ -177,6 +177,7 @@ server.tool(
         content: [{
           type: "text", text:
             `Error [${code}]: ${e.message}\n\n` +
+            (code === "AUTH_ERROR" ? "[hint] Authentication failed. Refresh or log in to the account in WAM.\n" : "") +
             `[hint] Suggestions based on error type:\n` +
             `  - Reduce tree_depth (current: ${tree_depth})\n` +
             `  - Add exclude_paths to filter large directories (e.g. ['node_modules', 'dist'])\n` +

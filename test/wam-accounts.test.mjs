@@ -62,3 +62,9 @@ test('bridge error does not expose subprocess output', async () => {
   await assert.rejects(loadWamAccounts('nonexistent-wam-test.exe'), /WAM_UNAVAILABLE/);
   assert.equal(classifyFailure(undefined, 'Error: Rate limited, please try again later'), 'limited');
 });
+
+test('wrapped HTTP auth and quota errors retain classification', () => {
+  assert.equal(classifyFailure({code:'AUTH_ERROR',details:{status:401}}), 'auth');
+  assert.equal(classifyFailure({code:'AUTH_ERROR',details:{status:403}}), 'denied');
+  assert.equal(classifyFailure({code:'RATE_LIMITED',details:{status:429}}), 'limited');
+});
