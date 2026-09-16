@@ -180,6 +180,12 @@ server.tool(
       return { isError: /^\s*(?:Error\b|\[Error\])/.test(result), content: [{ type: "text", text: result }] };
     } catch (e) {
       const code = e.code || "UNKNOWN";
+      if (String(code).startsWith("WAM_")) {
+        return { isError: true, content: [{ type: "text", text:
+          `Error [${code}]: ${e.message}\n\n` +
+          '[hint] Local WAM account access failed before retrieval. Check the account manager and MCP launcher diagnostics; search depth and query size do not affect this error.'
+        }] };
+      }
       return {
         isError: true,
         content: [{

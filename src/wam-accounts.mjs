@@ -7,7 +7,7 @@ import { diagnostic, requestSignal, lastUpstreamError } from './reliability.mjs'
 
 const exec = promisify(execFile);
 const fingerprint = key => createHash('sha256').update(key).digest('hex');
-const fail = code => Object.assign(new Error(code), { code });
+const fail = (code, message = code) => Object.assign(new Error(message), { code });
 
 export function resolveWamExecutable(env = process.env, platform = process.platform, exists = existsSync) {
   if (env.FC_WAM_EXE?.trim()) return env.FC_WAM_EXE;
@@ -45,7 +45,13 @@ export async function loadWamAccounts(executable = resolveWamExecutable()) {
       appDataPresent: !!process.env.APPDATA,
       databaseExists: !!process.env.APPDATA && existsSync(join(process.env.APPDATA, 'com.chao.windsurf-account-manager', 'accounts.db')) });
     // execFile errors can contain credential-bearing stdout. Never propagate them.
-    throw fail('WAM_UNAVAILABLE: open WAM and log in, then refresh account information');
+    if (reason === 'WAM_DATA_NOT_FOUND') {
+      throw fail(reason, 'WAM account database is not visible to the MCP process. Check the Windows user/profile and the gateway launcher environment.');
+    }
+    if (reason === 'WAM_STORAGE_ERROR') {
+      throw fail(reason, 'WAM account storage could not be read. Check database access and the credential store in the same Windows user session.');
+    }
+    throw fail('WAM_UNAVAILABLE', 'WAM_UNAVAILABLE: the local credential bridge failed to run. Check the installed executable and gateway launcher environment.');
   }
 }
 
