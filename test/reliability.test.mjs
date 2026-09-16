@@ -3,18 +3,22 @@ import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { runSearch, retryRequest, requestSignal } from '../src/reliability.mjs';
 
-test('serialized searches; cancelling middle waiter never lets third overtake first', async () => {
-  const order=[]; let release;
-  const gate=new Promise(r=>{release=r});
-  const first=runSearch(async()=>{order.push('first');await gate;order.push('end');return 'ok'});
-  const c=new AbortController();
-  const second=runSearch(async()=>{order.push('wrong');return 'ok'},c.signal);
-  const rejected=assert.rejects(second);
-  const third=runSearch(async()=>{order.push('third');return 'ok'});
-  c.abort();await rejected;await delay(10);
-  assert.deepEqual(order,['first']);release();await Promise.all([first,third]);
-  assert.deepEqual(order,['first','end','third']);
+test('three searches overlap; cancelled waiter never executes and slots recover', async () => {
+  let release; const gate = new Promise(r => { release = r; });
+  let active = 0, maximum = 0;
+  const jobs = Array.from({length: 3}, () => runSearch(async () => {
+    maximum = Math.max(maximum, ++active); await gate; active--; return 'ok';
+  }));
+  await delay(10);
+  assert.equal(active, 3);
+  const c = new AbortController();
+  const cancelled = assert.rejects(runSearch(async () => { throw new Error('must not execute'); }, c.signal));
+  let fourth = false;
+  const next = runSearch(async () => { fourth = true; return 'ok'; });
+  c.abort(); await cancelled; await delay(10); assert.equal(fourth, false);
+  release(); await Promise.all([...jobs, next]); assert.equal(maximum, 3); assert.equal(fourth, true);
 });
+
 test('active cancellation aborts request and releases queue',async()=>{
  const c=new AbortController();
  const p=runSearch(async()=>{await delay(5000,undefined,{signal:requestSignal(5000)});return 'wrong'},c.signal);
@@ -58,9 +62,7 @@ test('real core retries HTTP 200 Connect exhaustion before any tool execution',a
  }finally{globalThis.fetch=original;rmSync(root,{recursive:true,force:true})}
 });
 
-test('exhaustion cools down the queue and cooldown remains cancellable',async()=>{
+test('one exhausted account does not pause unrelated searches', async () => {
  await assert.rejects(retryRequest(async()=>{throw Object.assign(new Error('quota'),{rpcCode:'resource_exhausted'})},{maxRetries:0}));
- const c=new AbortController();let called=false;
- const p=runSearch(async()=>{called=true;return 'wrong'},c.signal);
- const rejected=assert.rejects(p);await delay(10);c.abort();await rejected;assert.equal(called,false);
+ assert.equal(await runSearch(async () => 'healthy'), 'healthy');
 });

@@ -326,7 +326,7 @@ through a short-lived local process pipe; passwords and refresh tokens are not e
 No plaintext token file or HTTP credential endpoint is used. When enabled, WAM failure
 never silently falls back to WINDSURF_API_KEY or another desktop account.
 
-Within the single MCP server queue, choose the least recently used eligible account
+Within the shared MCP server, choose the least recently used eligible account
 and pin it for the whole read-only search. Network disconnects, 502/503/504,
 resource_exhausted and HTTP 429 may replay the search on one other healthy account,
 at most once in total and within the existing deadline, after request-level retries.
@@ -349,3 +349,22 @@ never subprocess stdout. Check these events rather than assuming an installed pl
 means account rotation is enabled. For McpMux user-config servers, preserve `FC_WAM_EXE`
 in the source space JSON, not only the cached database definition. Restart the gateway
 after changing its launcher environment; reconnecting a child can retain stale settings.
+
+
+### Concurrent searches and cancellation
+
+The shared server admits at most three active searches and eight waiting requests.
+A queue or account-lease wait is limited to 10 seconds; the complete request,
+including queue time and any failover, has a 50-second budget. This is deliberately
+shorter than McpMux's 60-second tool timeout (the plugin's outer timeout is 120 seconds).
+An account fingerprint has at most one active lease. Busy healthy accounts can be
+waited for; cancellation removes waiters, and quota cooldown only affects that account.
+Explicit single-key mode retains a one-request account gate.
+
+Each search attempt runs in its own worker thread so synchronous repository scanning
+cannot block other requests or the parent cancellation timer. Cancellation aborts worker
+network/async ripgrep operations and terminates the worker before releasing its lease
+and concurrency slot. Workers are disposable: in-memory search/JWT caches do not survive
+between requests. Credentials remain in process memory and are not serialized to disk.
+Use one shared server: leases coordinate requests within that process, not across
+independently launched MCP servers. Do not launch multiple servers against the same state file.

@@ -9,6 +9,7 @@ import { execFileSync, execFile as execFileCb } from "node:child_process";
 import { readdirSync, readFileSync, statSync, existsSync } from "node:fs";
 import { join, resolve, relative, sep, basename } from "node:path";
 import { promisify } from "node:util";
+import { requestSignal } from './reliability.mjs';
 import { rgPath } from "@vscode/ripgrep";
 import treeNodeCli from "tree-node-cli";
 import { resolveWithinRoot } from "./path-safety.mjs";
@@ -150,6 +151,7 @@ export class ToolExecutor {
 
     try {
       const { stdout } = await execFileAsync(rgPath, args, {
+        signal: requestSignal(30000),
         timeout: 30000,
         maxBuffer: 10 * 1024 * 1024,
         env: { ...process.env, RIPGREP_CONFIG_PATH: "" },

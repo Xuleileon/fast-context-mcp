@@ -5,9 +5,38 @@ import { dirname } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 const context = new AsyncLocalStorage();
-let tail = Promise.resolve();
-let pending = 0;
-let cooldownUntil = 0;
+export class Semaphore {
+  constructor(limit, maxWaiting = 8) { this.limit = limit; this.maxWaiting = maxWaiting; this.active = 0; this.waiters = []; }
+  async acquire(signal) {
+    signal?.throwIfAborted();
+    if (this.active < this.limit) { this.active++; return this.releaseHandle(); }
+    if (this.waiters.length >= this.maxWaiting) throw Object.assign(new Error('Search queue full; use local search.'), { code: 'QUEUE_FULL' });
+    return new Promise((resolve, reject) => {
+      const waiter = { resolve, signal, abort: () => {
+        this.waiters = this.waiters.filter(w => w !== waiter);
+        reject(signal.reason);
+      }};
+      this.waiters.push(waiter);
+      signal?.addEventListener('abort', waiter.abort, { once: true });
+    });
+  }
+  releaseHandle() {
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const waiter = this.waiters.shift();
+      if (waiter) {
+        waiter.signal?.removeEventListener('abort', waiter.abort);
+        waiter.resolve(this.releaseHandle());
+      } else this.active--;
+    };
+  }
+}
+const searches = new Semaphore(3);
+export function searchContext(task, state) { return context.run(state, task); }
+export function currentRequest() { return context.getStore(); }
+export function recordUpstreamError(error) { const state = context.getStore(); if (state) state.lastError = error; }
 
 // Fixed fields only: never log query, paths, credentials, payloads or error messages.
 export function diagnostic(event, fields = {}) {
@@ -36,41 +65,24 @@ export function requestSignal(timeoutMs) {
 }
 
 export async function runSearch(task, signal) {
-  if (pending >= 8) throw Object.assign(new Error('Search queue full; retry later.'), { code: 'QUEUE_FULL' });
   const started = Date.now();
-  const deadline = requestSignal(110000);
+  const deadline = requestSignal(50000);
   const combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
-  const previous = tail;
-  let release;
-  tail = new Promise(resolve => { release = resolve; });
-  pending++;
-  return context.run({ id: randomUUID(), signal: combined }, async () => {
-    diagnostic('queued', { pending });
-    let onAbort;
+  return context.run({ id: randomUUID(), signal: combined, deadlineAt: started + 50000 }, async () => {
+    diagnostic('queued', { pending: searches.active + searches.waiters.length + 1 });
+    let release;
     try {
-      await Promise.race([previous, new Promise((_, reject) => {
-        onAbort = () => reject(combined.reason);
-        combined.addEventListener('abort', onAbort, { once: true });
-        if (combined.aborted) onAbort();
-      })]);
+      release = await searches.acquire(AbortSignal.any([combined, AbortSignal.timeout(10000)]));
       combined.throwIfAborted();
-      const waitMs = Math.max(0, cooldownUntil - Date.now());
-      diagnostic('started', { queueMs: Date.now() - started, cooldownMs: waitMs });
-      if (waitMs) await delay(waitMs, undefined, { signal: combined });
+      diagnostic('started', { queueMs: Date.now() - started, active: searches.active });
       const result = await task();
       combined.throwIfAborted();
-      const failed = /^\s*(?:Error\b|\[Error\])/.test(result);
-      diagnostic('finished', { outcome: failed ? 'error' : 'success', elapsedMs: Date.now() - started });
+      diagnostic('finished', { outcome: /^\s*(?:Error\b|\[Error\])/.test(result) ? 'error' : 'success', elapsedMs: Date.now() - started });
       return result;
     } catch (e) {
-      diagnostic('finished', { outcome: combined.aborted ? 'cancelled_or_timeout' : 'error', elapsedMs: Date.now() - started });
+      diagnostic('finished', { outcome: combined.aborted || e.name === 'TimeoutError' ? 'cancelled_or_timeout' : 'error', elapsedMs: Date.now() - started });
       throw e;
-    } finally {
-      combined.removeEventListener('abort', onAbort);
-      // A cancelled waiter must not allow successors to overtake the running task.
-      previous.finally(release);
-      pending--;
-    }
+    } finally { release?.(); }
   });
 }
 
@@ -90,12 +102,10 @@ export async function retryRequest(operation, { maxRetries = 2, sleep = delay, r
       const transient = ['resource_exhausted', 'unavailable', 'internal', 'aborted'].includes(e.rpcCode)
         || e.status === 429 || [500, 502, 503, 504].includes(e.status)
         || (e instanceof TypeError && !e.status && !e.rpcCode);
-      const exhausted = e.rpcCode === 'resource_exhausted' || e.status === 429;
       const retry = transient && attempt < maxRetries && !signal?.aborted;
       diagnostic('upstream', { callId, attempt: attempt + 1, outcome: 'error', status: e.status,
         rpcCode: e.rpcCode, traceId: e.traceId, elapsedMs: Date.now() - start, retry });
       if (!retry) {
-        if (exhausted) cooldownUntil = Math.max(cooldownUntil, Date.now() + Math.max(30000, e.retryAfterMs || 0));
         throw e;
       }
       const waitMs = Math.max(e.retryAfterMs || 0, 1000 * 2 ** attempt + Math.floor(random() * 500));

@@ -3,7 +3,7 @@ import { promisify } from 'node:util';
 import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { diagnostic, requestSignal, lastUpstreamError } from './reliability.mjs';
+import { diagnostic, requestSignal, lastUpstreamError, Semaphore } from './reliability.mjs';
 
 const exec = promisify(execFile);
 const fingerprint = key => createHash('sha256').update(key).digest('hex');
@@ -74,6 +74,7 @@ export function classifyFailure(error, result) {
 export class AccountPool {
   constructor({ file, now = Date.now, log = diagnostic } = {}) {
     this.file = file; this.now = now; this.log = log;
+    this.busy = new Set(); this.waiters = new Set();
     this.state = { cooldownUntil: 0, accounts: {} };
     if (file) {
       try {
@@ -96,7 +97,7 @@ export class AccountPool {
     const candidates = accounts.map(a => ({ ...a, fingerprint: fingerprint(a.apiKey) }))
       .filter(a => {
         const s = this.state.accounts[a.fingerprint];
-        return !excluded.has(a.fingerprint) && !s?.blocked && !(s?.cooldownUntil > now);
+        return !this.busy.has(a.fingerprint) && !excluded.has(a.fingerprint) && !s?.blocked && !(s?.cooldownUntil > now);
       }).sort((a, b) => (this.state.accounts[a.fingerprint]?.lastUsed || 0) - (this.state.accounts[b.fingerprint]?.lastUsed || 0)
         || a.accountId.localeCompare(b.accountId));
     const chosen = candidates[0];
@@ -118,40 +119,72 @@ export class AccountPool {
     this.save();
     this.log('account_result', { accountId: account.accountId, outcome: kind });
   }
+  async acquire(accounts, excluded, signal) {
+    while (true) {
+      signal?.throwIfAborted();
+      try {
+        const account = this.select(accounts, excluded);
+        this.busy.add(account.fingerprint);
+        return account;
+      } catch (e) {
+        if (e.code !== 'WAM_NO_READY_ACCOUNT' || !accounts.some(a => {
+          const id = fingerprint(a.apiKey), state = this.state.accounts[id];
+          return !excluded.has(id) && this.busy.has(id) && !state?.blocked && !(state?.cooldownUntil > this.now());
+        })) throw e;
+      }
+      await new Promise((resolve, reject) => {
+        const done = () => { this.waiters.delete(done); signal?.removeEventListener('abort', abort); resolve(); };
+        const abort = () => { this.waiters.delete(done); reject(signal.reason); };
+        this.waiters.add(done);
+        signal?.addEventListener('abort', abort, { once: true });
+      });
+    }
+  }
+  release(account) {
+    this.busy.delete(account.fingerprint);
+    for (const wake of [...this.waiters]) wake();
+  }
   async run(accounts, task, { getFailure = () => undefined, signal } = {}) {
     const excluded = new Set();
     for (let attempt = 0; attempt < 2; attempt++) {
       signal?.throwIfAborted();
-      const account = this.select(accounts, excluded);
+      const account = await this.acquire(accounts, excluded, signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(10000)]) : AbortSignal.timeout(10000));
       let result, error;
-      try { result = await task(account.apiKey); } catch (e) { error = e; }
-      const upstream = error || (/^\s*(?:Error\b|\[Error\])/.test(result || '') ? getFailure() : undefined);
-      const kind = classifyFailure(upstream, result);
-      this.report(account, kind, upstream?.retryAfterMs);
-      // Read-only search only. No replay for permission or authentication errors.
-      if (['network', 'limited'].includes(kind) && attempt === 0 && !signal?.aborted) {
-        excluded.add(account.fingerprint);
-        const ready = accounts.some(a => {
-          const id = fingerprint(a.apiKey), s = this.state.accounts[id];
-          return !excluded.has(id) && !s?.blocked && !(s?.cooldownUntil > this.now());
-        });
-        if (ready) { this.log('account_failover', { reason: kind }); continue; }
-      }
-      if (error) throw error;
-      return result;
+      try {
+        signal?.throwIfAborted();
+        try { result = await task(account.apiKey); } catch (e) { error = e; }
+        if (signal?.aborted) throw error || signal.reason;
+        const upstream = error || (/^\s*(?:Error\b|\[Error\])/.test(result || '') ? getFailure() : undefined);
+        const kind = classifyFailure(upstream, result);
+        this.report(account, kind, upstream?.retryAfterMs);
+        // Read-only search only. No replay for permission or authentication errors.
+        if (['network', 'limited'].includes(kind) && attempt === 0 && !signal?.aborted) {
+          excluded.add(account.fingerprint);
+          const ready = accounts.some(a => {
+            const id = fingerprint(a.apiKey), s = this.state.accounts[id];
+            return !excluded.has(id) && !s?.blocked && !(s?.cooldownUntil > this.now());
+          });
+          if (ready) { this.log('account_failover', { reason: kind }); continue; }
+        }
+        if (error) throw error;
+        return result;
+      } finally { this.release(account); }
     }
   }
 }
 
 let pool;
+const singleAccount = new Semaphore(1);
 export async function withWamAccount(task) {
   const executable = resolveWamExecutable();
   if (!executable) {
     diagnostic('account_mode', { mode: 'single' });
-    return task(undefined);
+    const release = await singleAccount.acquire(requestSignal(10000));
+    try { return await task(undefined); } finally { release(); }
   }
   pool ||= new AccountPool({ file: process.env.FC_WAM_STATE_FILE || join(process.env.LOCALAPPDATA || process.cwd(), 'fast-context-mcp', 'account-state.json') });
   const accounts = await loadWamAccounts(executable);
   diagnostic('account_mode', { mode: 'pool', eligibleAccounts: accounts.length });
-  return pool.run(accounts, key => { lastUpstreamError(true); return task(key); }, { getFailure: lastUpstreamError, signal: requestSignal(110000) });
+  return pool.run(accounts, key => { lastUpstreamError(true); return task(key); }, { getFailure: lastUpstreamError, signal: requestSignal(50000) });
 }

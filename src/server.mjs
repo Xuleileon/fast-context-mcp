@@ -21,7 +21,8 @@ import { z } from "zod";
 
 import { withWamAccount } from "./wam-accounts.mjs";
 import { runSearch } from "./reliability.mjs";
-import { searchWithContent, extractKeyInfo } from "./core.mjs";
+import { extractKeyInfo } from "./core.mjs";
+import { workerSearch } from "./worker-search.mjs";
 
 /**
  * Parse an integer env var with optional clamping.
@@ -165,7 +166,7 @@ server.tool(
     }
 
     try {
-      const result = await runSearch(() => withWamAccount(apiKey => searchWithContent({
+      const result = await runSearch(() => withWamAccount(apiKey => workerSearch({
         apiKey,
         query,
         projectRoot: projectPath,
@@ -180,6 +181,12 @@ server.tool(
       return { isError: /^\s*(?:Error\b|\[Error\])/.test(result), content: [{ type: "text", text: result }] };
     } catch (e) {
       const code = e.code || "UNKNOWN";
+      if (e.name === 'TimeoutError' || e.name === 'AbortError' || code === 'QUEUE_FULL') {
+        return { isError: true, content: [{ type: 'text', text:
+          `Error [${code === 'QUEUE_FULL' ? code : 'SEARCH_CANCELLED_OR_TIMEOUT'}]: Search cancelled or its queue/execution budget expired. ` +
+          'At most three searches run concurrently; queue wait is bounded to 10 seconds and total work to 50 seconds. Use local search for this request.'
+        }] };
+      }
       if (String(code).startsWith("WAM_")) {
         return { isError: true, content: [{ type: "text", text:
           `Error [${code}]: ${e.message}\n\n` +
