@@ -38,13 +38,16 @@ export async function loadWamAccounts(executable = resolveWamExecutable()) {
     let reason;
     try {
       const code = JSON.parse(error.stdout).error;
-      if (['WAM_DATA_NOT_FOUND', 'WAM_STORAGE_ERROR'].includes(code)) reason = code;
+      if (['WAM_DATA_NOT_FOUND', 'WAM_STORAGE_ERROR', 'WAM_DATA_CONFIG_ERROR'].includes(code)) reason = code;
     } catch {}
     diagnostic('wam_bridge_error', { code: typeof error.code === 'number' ? error.code :
       ['ENOENT', 'EACCES', 'ABORT_ERR', 'WAM_INVALID_RESPONSE'].includes(error.code) ? error.code : 'BRIDGE_FAILED', reason,
       appDataPresent: !!process.env.APPDATA,
       databaseExists: !!process.env.APPDATA && existsSync(join(process.env.APPDATA, 'com.chao.windsurf-account-manager', 'accounts.db')) });
     // execFile errors can contain credential-bearing stdout. Never propagate them.
+    if (reason === 'WAM_DATA_CONFIG_ERROR') {
+      throw fail(reason, 'The configured WAM data directory is unavailable or invalid. Restore access to the existing account database; no fallback store was created.');
+    }
     if (reason === 'WAM_DATA_NOT_FOUND') {
       throw fail(reason, 'WAM account database is not visible to the MCP process. Check the Windows user/profile and the gateway launcher environment.');
     }
