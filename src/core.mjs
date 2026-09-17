@@ -11,7 +11,7 @@
  *   → ANSWER: file paths + line ranges + suggested rg patterns
  */
 
-import { retryRequest, requestSignal } from "./reliability.mjs";
+import { retryRequest, requestSignal, diagnostic } from "./reliability.mjs";
 import { resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 import { randomUUID } from "node:crypto";
@@ -700,6 +700,7 @@ export async function search({
   timeoutMs = 30000,
   excludePaths = [],
   onProgress = null,
+  useCache = true,
 }) {
   const log = (msg) => onProgress?.(msg);
   projectRoot = resolve(projectRoot);
@@ -707,9 +708,11 @@ export async function search({
   // Cache hits avoid auth/network and repo-map work. The bounded recursive
   // fingerprint tracks visited file paths, sizes and mtimes; the cache also
   // validates every returned file's stats independently of that walk.
-  const mtimeHash = computeMtimeHash(projectRoot, excludePaths);
-  const cacheKey = buildCacheKey({ query, projectRoot, model: WS_MODEL, maxTurns, maxCommands, maxResults, treeDepth, mtimeHash, excludePaths });
-  const cached = getCachedResult(cacheKey);
+  let stageStarted = Date.now();
+  const mtimeHash = useCache ? computeMtimeHash(projectRoot, excludePaths) : "";
+  diagnostic("phase", { phase: "fingerprint", skipped: !useCache, elapsedMs: Date.now() - stageStarted });
+  const cacheKey = useCache && buildCacheKey({ query, projectRoot, model: WS_MODEL, maxTurns, maxCommands, maxResults, treeDepth, mtimeHash, excludePaths });
+  const cached = useCache && getCachedResult(cacheKey);
   if (cached) {
     log("Cache hit");
     return { ...cached, _meta: { ...cached._meta, cache_hit: true } };
@@ -721,12 +724,17 @@ export async function search({
   }
   if (!jwt) {
     log("Fetching JWT...");
+    stageStarted = Date.now();
     jwt = await getCachedJwt(apiKey);
+    diagnostic("phase", { phase: "authentication", elapsedMs: Date.now() - stageStarted });
   }
 
   // Check rate limit
   log("Checking rate limit...");
-  if (!(await checkRateLimit(apiKey, jwt))) {
+  stageStarted = Date.now();
+  const rateReady = await checkRateLimit(apiKey, jwt);
+  diagnostic("phase", { phase: "quota_check", elapsedMs: Date.now() - stageStarted });
+  if (!rateReady) {
     return { files: [], error: "Rate limited, please try again later" };
   }
 
@@ -734,7 +742,9 @@ export async function search({
   const toolDefs = getToolDefinitions(maxCommands);
   const systemPrompt = buildWindsurfPrompt(maxTurns, maxCommands, maxResults);
 
+  stageStarted = Date.now();
   const { tree: repoMap, depth: actualDepth, sizeBytes: treeSizeBytes, fellBack } = getRepoMap(projectRoot, treeDepth, excludePaths);
+  diagnostic("phase", { phase: "repo_map", elapsedMs: Date.now() - stageStarted });
   log(`Repo map: tree -L ${actualDepth} (${(treeSizeBytes / 1024).toFixed(1)}KB)${fellBack ? ` [fell back from L=${treeDepth}]` : ""}`);
 
   const userContent = `Problem Statement: ${query}\n\nRepo Map (tree -L ${actualDepth} /codebase):\n\`\`\`text\n${repoMap}\n\`\`\``;
@@ -818,7 +828,7 @@ export async function search({
       result._meta = { treeDepth: actualDepth, treeSizeKB: +(treeSizeBytes / 1024).toFixed(1), fellBack, cache_hit: false, projectRoot };
       // AC#3: skip caching empty results so auto-escalation can retry next time
       if (result.files?.length > 0) {
-        setCachedResult(cacheKey, result);
+        if (useCache) setCachedResult(cacheKey, result);
       }
       return result;
     }
@@ -918,11 +928,12 @@ export async function searchWithContent({
   timeoutMs = 30000,
   excludePaths = [],
   snippetChars = 6000,
+  useCache = true,
 }) {
   if (!Number.isSafeInteger(snippetChars) || snippetChars < 0 || snippetChars > 12000) {
     throw new RangeError("snippetChars must be an integer from 0 to 12000");
   }
-  const result = await search({ query, projectRoot, apiKey, maxTurns, maxCommands, maxResults, treeDepth, timeoutMs, excludePaths });
+  const result = await search({ query, projectRoot, apiKey, maxTurns, maxCommands, maxResults, treeDepth, timeoutMs, excludePaths, useCache });
 
   if (result.error) {
     const meta = result._meta;

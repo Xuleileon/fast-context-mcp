@@ -3,7 +3,7 @@ import { promisify } from 'node:util';
 import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { diagnostic, requestSignal, lastUpstreamError, Semaphore } from './reliability.mjs';
+import { diagnostic, requestSignal, lastUpstreamError, Semaphore, requireExecutionBudget } from './reliability.mjs';
 
 const exec = promisify(execFile);
 const fingerprint = key => createHash('sha256').update(key).digest('hex');
@@ -148,11 +148,11 @@ export class AccountPool {
     const excluded = new Set();
     for (let attempt = 0; attempt < 2; attempt++) {
       signal?.throwIfAborted();
-      const account = await this.acquire(accounts, excluded, signal
-        ? AbortSignal.any([signal, AbortSignal.timeout(10000)]) : AbortSignal.timeout(10000));
+      const account = await this.acquire(accounts, excluded, signal || requestSignal(50000));
       let result, error;
       try {
         signal?.throwIfAborted();
+        requireExecutionBudget();
         try { result = await task(account.apiKey); } catch (e) { error = e; }
         if (signal?.aborted) throw error || signal.reason;
         const upstream = error || (/^\s*(?:Error\b|\[Error\])/.test(result || '') ? getFailure() : undefined);
@@ -180,8 +180,8 @@ export async function withWamAccount(task) {
   const executable = resolveWamExecutable();
   if (!executable) {
     diagnostic('account_mode', { mode: 'single' });
-    const release = await singleAccount.acquire(requestSignal(10000));
-    try { return await task(undefined); } finally { release(); }
+    const release = await singleAccount.acquire(requestSignal(50000));
+    try { requireExecutionBudget(); return await task(undefined); } finally { release(); }
   }
   pool ||= new AccountPool({ file: process.env.FC_WAM_STATE_FILE || join(process.env.LOCALAPPDATA || process.cwd(), 'fast-context-mcp', 'account-state.json') });
   const accounts = await loadWamAccounts(executable);

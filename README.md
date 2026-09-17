@@ -354,8 +354,9 @@ after changing its launcher environment; reconnecting a child can retain stale s
 ### Concurrent searches and cancellation
 
 The shared server admits at most three active searches and eight waiting requests.
-A queue or account-lease wait is limited to 10 seconds; the complete request,
-including queue time and any failover, has a 50-second budget. This is deliberately
+Queue, account-lease waiting, execution and any failover share one 50-second budget.
+There is no separate 10-second queue timeout. Retrieval starts only if at least
+10 seconds remain; otherwise SEARCH_BUDGET_INSUFFICIENT is returned. This is deliberately
 shorter than McpMux's 60-second tool timeout (the plugin's outer timeout is 120 seconds).
 An account fingerprint has at most one active lease. Busy healthy accounts can be
 waited for; cancellation removes waiters, and quota cooldown only affects that account.
@@ -368,3 +369,9 @@ and concurrency slot. Workers are disposable: in-memory search/JWT caches do not
 between requests. Credentials remain in process memory and are not serialized to disk.
 Use one shared server: leases coordinate requests within that process, not across
 independently launched MCP servers. Do not launch multiple servers against the same state file.
+
+Phase diagnostics report worker startup, cache fingerprinting, authentication, quota
+check and repository map timings without queries, paths or credentials. Disposable
+workers skip result-cache fingerprinting because their in-memory cache is always empty;
+normal core API callers retain cache invalidation. Queue timeout, execution timeout,
+caller cancellation and insufficient remaining budget have distinct error codes.

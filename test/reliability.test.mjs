@@ -45,6 +45,29 @@ import { connectFrameEncode } from '../src/protobuf.mjs';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+
+test('disposable search skips cache fingerprint file stats while normal callers retain them', async () => {
+ const root = mkdtempSync(join(tmpdir(), 'fc-disposable-'));
+ const file = join(root, '.fingerprint-probe');
+ writeFileSync(file, 'fixture');
+ const oldStat = fs.statSync, oldFetch = globalThis.fetch;
+ let visits = 0;
+ fs.statSync = function(path, ...args) { if (String(path) === file) visits++; return oldStat.call(this, path, ...args); };
+ syncBuiltinESMExports();
+ globalThis.fetch = async () => new Response(Buffer.alloc(0));
+ try {
+  const options = { query: 'cache-scan-probe', projectRoot: root, apiKey: 'fixture', jwt: 'fixture', maxTurns: 1 };
+  await search({ ...options, useCache: false });
+  assert.equal(visits, 0);
+  await search(options);
+  assert.ok(visits > 0);
+ } finally {
+  fs.statSync = oldStat; syncBuiltinESMExports(); globalThis.fetch = oldFetch;
+  rmSync(root, { recursive: true, force: true });
+ }
+});
 
 test('real core retries HTTP 200 Connect exhaustion before any tool execution',async()=>{
  const root=mkdtempSync(join(tmpdir(),'fc-retry-'));

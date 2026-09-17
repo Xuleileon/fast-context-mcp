@@ -5,7 +5,7 @@ import { currentRequest, requestSignal, recordUpstreamError } from './reliabilit
 export async function workerSearch(options, { url = new URL('./search-worker.mjs', import.meta.url), signal = requestSignal(50000) } = {}) {
   signal.throwIfAborted();
   const worker = new Worker(url, { workerData: {
-    options, requestId: currentRequest()?.id,
+    options, requestId: currentRequest()?.id, spawnedAt: Date.now(),
     remainingMs: Math.max(1, (currentRequest()?.deadlineAt || Date.now() + 50000) - Date.now()),
   } });
   let onAbort;

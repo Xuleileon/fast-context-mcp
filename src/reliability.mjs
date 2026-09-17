@@ -64,6 +64,12 @@ export function requestSignal(timeoutMs) {
   return signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs);
 }
 
+export function requireExecutionBudget(deadlineAt = currentRequest()?.deadlineAt, now = Date.now()) {
+  if (deadlineAt !== undefined && deadlineAt - now < 10000) {
+    throw Object.assign(new Error('Busy: less than 10 seconds remain in the shared search budget; retrieval was not started.'), { code: 'SEARCH_BUDGET_INSUFFICIENT' });
+  }
+}
+
 export async function runSearch(task, signal) {
   const started = Date.now();
   const deadline = requestSignal(50000);
@@ -72,15 +78,24 @@ export async function runSearch(task, signal) {
     diagnostic('queued', { pending: searches.active + searches.waiters.length + 1 });
     let release;
     try {
-      release = await searches.acquire(AbortSignal.any([combined, AbortSignal.timeout(10000)]));
+      release = await searches.acquire(combined);
       combined.throwIfAborted();
+      requireExecutionBudget();
       diagnostic('started', { queueMs: Date.now() - started, active: searches.active });
       const result = await task();
       combined.throwIfAborted();
       diagnostic('finished', { outcome: /^\s*(?:Error\b|\[Error\])/.test(result) ? 'error' : 'success', elapsedMs: Date.now() - started });
       return result;
     } catch (e) {
-      diagnostic('finished', { outcome: combined.aborted || e.name === 'TimeoutError' ? 'cancelled_or_timeout' : 'error', elapsedMs: Date.now() - started });
+      if (combined.aborted) {
+        const cancelled = signal?.aborted;
+        e = Object.assign(new Error(cancelled ? 'Search cancelled by caller.' :
+          release ? 'Search execution reached the shared 50-second deadline.' : 'Search queue reached the shared 50-second deadline.'), {
+          code: cancelled ? 'SEARCH_CANCELLED' : release ? 'SEARCH_EXECUTION_TIMEOUT' : 'SEARCH_QUEUE_TIMEOUT',
+        });
+      }
+      diagnostic('finished', { outcome: combined.aborted || e.name === 'TimeoutError' ? 'cancelled_or_timeout' : 'error',
+        errorCode: /^SEARCH_[A-Z_]+$/.test(e.code || '') ? e.code : undefined, elapsedMs: Date.now() - started });
       throw e;
     } finally { release?.(); }
   });

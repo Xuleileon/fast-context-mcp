@@ -181,10 +181,10 @@ server.tool(
       return { isError: /^\s*(?:Error\b|\[Error\])/.test(result), content: [{ type: "text", text: result }] };
     } catch (e) {
       const code = e.code || "UNKNOWN";
-      if (e.name === 'TimeoutError' || e.name === 'AbortError' || code === 'QUEUE_FULL') {
+      if (String(code).startsWith('SEARCH_') || e.name === 'TimeoutError' || e.name === 'AbortError' || code === 'QUEUE_FULL') {
         return { isError: true, content: [{ type: 'text', text:
-          `Error [${code === 'QUEUE_FULL' ? code : 'SEARCH_CANCELLED_OR_TIMEOUT'}]: Search cancelled or its queue/execution budget expired. ` +
-          'At most three searches run concurrently; queue wait is bounded to 10 seconds and total work to 50 seconds. Use local search for this request.'
+          `Error [${code}]: ${e.message} ` +
+          'Queue and execution share a 50-second deadline; three searches may run concurrently. Use local search for this request.'
         }] };
       }
       if (String(code).startsWith("WAM_")) {

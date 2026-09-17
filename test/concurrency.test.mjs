@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { AccountPool } from '../src/wam-accounts.mjs';
 import { workerSearch } from '../src/worker-search.mjs';
-import { Semaphore } from '../src/reliability.mjs';
+import { Semaphore, runSearch, requireExecutionBudget } from '../src/reliability.mjs';
 
 const accounts = ['a', 'b', 'c'].map(accountId => ({ accountId, apiKey: `fake-${accountId}` }));
 test('account leases are exclusive across concurrent requests and released on cancellation', async () => {
@@ -63,4 +63,24 @@ test('CPU-blocked worker cannot block cancellation or an independent result', as
   assert.equal(await workerSearch({}, { url: fast }), 'ok');
   controller.abort(); await cancelled;
   assert.ok(Date.now() - started < 3000);
+});
+
+test('fourth request survives more than ten seconds of queuing and starts after release', async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const jobs = Array.from({ length: 3 }, () => runSearch(async () => { await gate; return 'ok'; }));
+  await delay(10);
+  let fourthStarted = false;
+  const fourth = runSearch(async () => { fourthStarted = true; return 'fourth'; });
+  try {
+    await delay(10500);
+    assert.equal(fourthStarted, false);
+  } finally { release(); }
+  assert.equal(await fourth, 'fourth');
+  await Promise.all(jobs);
+});
+
+test('insufficient remaining budget rejects before starting retrieval', () => {
+  assert.throws(() => requireExecutionBudget(49999, 40000), { code: 'SEARCH_BUDGET_INSUFFICIENT' });
+  assert.doesNotThrow(() => requireExecutionBudget(50000, 40000));
 });

@@ -1,12 +1,13 @@
 import { parentPort, workerData } from 'node:worker_threads';
 import { searchWithContent } from './core.mjs';
-import { searchContext, lastUpstreamError } from './reliability.mjs';
+import { searchContext, lastUpstreamError, diagnostic } from './reliability.mjs';
 
 const controller = new AbortController();
 parentPort.on('message', message => { if (message === 'cancel') controller.abort(); });
 await searchContext(async () => {
   try {
-    const result = await searchWithContent(workerData.options);
+    diagnostic("phase", { phase: "worker_start", elapsedMs: Date.now() - workerData.spawnedAt });
+    const result = await searchWithContent({ ...workerData.options, useCache: false });
     const error = lastUpstreamError();
     parentPort.postMessage({ result, failure: error && {
       status: error.status, rpcCode: error.rpcCode || (error instanceof TypeError ? 'unavailable' : undefined), retryAfterMs: error.retryAfterMs,
